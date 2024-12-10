@@ -23,30 +23,47 @@ class TokenSnapshot:
         self.logger.info("Starting TokenSnapshot initialization...")
         
         # Load configuration from .env
-        self.rpc_url = os.getenv('SOLANA_RPC_URL')
+        self.primary_rpc_url = os.getenv('SOLANA_RPC_URL')
+        # Update RPC endpoints list (remove unreliable ones)
+        self.rpc_endpoints = [
+            self.primary_rpc_url,
+            "https://rpc.ankr.com/solana",
+            "https://api.mainnet-beta.solana.com"
+        ]
+        self.current_rpc_index = 0
+        self.rpc_url = self.rpc_endpoints[self.current_rpc_index]
+        
         self.token_mint = os.getenv('TOKEN_MINT_ADDRESS')
         self.target_mcap = float(os.getenv('TARGET_MCAP_SOL', '500'))
         self.snapshot_dir = os.getenv('SNAPSHOT_DIR', 'snapshots')
         
         # Even more conservative settings
-        self.request_delay = 15.0        # Increased to 15 seconds base delay
+        self.request_delay = 30.0        # Increased to 30 seconds base delay
         self.max_retries = 8
-        self.retry_delay = 30            # Increased to 30 seconds base retry delay
+        self.retry_delay = 45            # Increased to 45 seconds base retry delay
         self.jitter_range = 5.0
-        self.startup_cooldown = 30.0
+        self.startup_cooldown = 60.0     # Increased to 60 seconds
         
         # Circuit breaker settings
-        self.error_threshold = 3         # Number of errors before circuit breaks
-        self.circuit_cooldown = 300.0    # 5 minutes cooldown when circuit breaks
-        self.error_window = 60           # Time window for counting errors (seconds)
-        self.error_timestamps = []       # Track error timestamps
+        self.error_threshold = 2         # Reduced to 2 errors
+        self.circuit_cooldown = 300.0    # 5 minutes cooldown
+        self.error_window = 60
+        self.error_timestamps = []
         self.circuit_broken = False
         self.circuit_break_time = None
+        
+        # RPC endpoint rotation settings
+        self.endpoint_errors = {url: 0 for url in self.rpc_endpoints}
+        self.endpoint_cooldown = 600.0   # 10 minutes cooldown for failed endpoints
+        self.endpoint_last_error = {url: None for url in self.rpc_endpoints}
         
         # Add request tracking
         self.request_count = 0
         self.last_request_time = None
         self.error_count = 0
+        
+        # Add token threshold
+        self.min_token_amount = 1_000_000  # Minimum token amount to include
         
         # Log all configuration values
         self.logger.info("Configuration values:")
@@ -113,6 +130,25 @@ class TokenSnapshot:
         
         return False
 
+    def rotate_rpc_endpoint(self):
+        """Rotate to the next available RPC endpoint"""
+        current_time = datetime.now()
+        
+        # Try each endpoint
+        for _ in range(len(self.rpc_endpoints)):
+            self.current_rpc_index = (self.current_rpc_index + 1) % len(self.rpc_endpoints)
+            new_endpoint = self.rpc_endpoints[self.current_rpc_index]
+            
+            # Check if endpoint is in cooldown
+            last_error = self.endpoint_last_error[new_endpoint]
+            if last_error is None or (current_time - last_error).total_seconds() >= self.endpoint_cooldown:
+                self.rpc_url = new_endpoint
+                self.logger.info(f"Switched to RPC endpoint: {self.rpc_url}")
+                return True
+        
+        self.logger.error("All RPC endpoints are in cooldown!")
+        return False
+
     def make_rpc_request(self, method: str, params: List[Any], retry_count: int = 0) -> Dict:
         """Make a JSON RPC request with retry logic and rate limiting"""
         current_time = datetime.now()
@@ -122,13 +158,16 @@ class TokenSnapshot:
             wait_time = (self.circuit_break_time + timedelta(seconds=self.circuit_cooldown) - current_time).total_seconds()
             self.logger.warning(f"Circuit breaker active. Waiting {wait_time:.2f} seconds")
             sleep(wait_time)
+            # Rotate endpoint after circuit breaker
+            self.rotate_rpc_endpoint()
         
         self.logger.info(f"Starting RPC request for method: {method}")
+        self.logger.info(f"Using RPC endpoint: {self.rpc_url}")
         self.logger.info(f"Current settings: delay={self.request_delay}, retry_delay={self.retry_delay}")
         
-        # Exponential backoff for consecutive requests
+        # Super-exponential backoff for consecutive requests
         if self.error_count > 0:
-            self.request_delay = min(self.request_delay * 1.5, 60.0)  # Cap at 60 seconds
+            self.request_delay = min(self.request_delay * 2.0, 120.0)  # Cap at 120 seconds
             self.logger.info(f"Adjusted request delay to {self.request_delay} due to previous errors")
         
         # Log time since last request
@@ -173,23 +212,26 @@ class TokenSnapshot:
                 error_msg = result['error'].get('message', 'Unknown error')
                 self.error_count += 1
                 self.error_timestamps.append(current_time)
+                self.endpoint_errors[self.rpc_url] += 1
+                self.endpoint_last_error[self.rpc_url] = current_time
                 
                 self.logger.error(f"RPC error {error_code}: {error_msg}")
                 self.logger.error(f"Total errors so far: {self.error_count}")
                 
-                if error_code in [-32005, 429] and retry_count < self.max_retries:
-                    base_wait_time = self.retry_delay * (3 ** retry_count)  # More aggressive backoff
-                    jitter = random.uniform(0, self.jitter_range)
-                    wait_time = base_wait_time + jitter
-                    self.logger.warning(f"Rate limited. Waiting {wait_time:.2f} seconds before retry {retry_count + 1}/{self.max_retries}")
-                    sleep(wait_time)
-                    return self.make_rpc_request(method, params, retry_count + 1)
-            else:
-                self.logger.info("Request successful")
-                # Reset error count and delay on success
-                self.error_count = 0
-                self.request_delay = 15.0
-                
+                if error_code in [-32005, 429]:
+                    # Rotate to next endpoint on rate limit
+                    if self.rotate_rpc_endpoint():
+                        # If rotation successful, retry immediately with new endpoint
+                        return self.make_rpc_request(method, params, retry_count)
+                    elif retry_count < self.max_retries:
+                        # If no rotation possible, wait and retry
+                        base_wait_time = self.retry_delay * (3 ** retry_count)
+                        jitter = random.uniform(0, self.jitter_range)
+                        wait_time = base_wait_time + jitter
+                        self.logger.warning(f"Rate limited. Waiting {wait_time:.2f} seconds before retry {retry_count + 1}/{self.max_retries}")
+                        sleep(wait_time)
+                        return self.make_rpc_request(method, params, retry_count + 1)
+            
             return result
             
         except Exception as e:
@@ -254,41 +296,86 @@ class TokenSnapshot:
             print(f"Error fetching account info: {str(e)}")
             return None
 
-    def get_token_accounts(self) -> List[Dict]:
-        """Query token holders using a combination of methods"""
-        print("\nStarting token account collection...")
+    def get_token_accounts_by_program(self) -> List[Dict]:
+        """Get token accounts using getProgramAccounts"""
         try:
+            filters = [
+                {
+                    "dataSize": 165  # Size of token account data
+                },
+                {
+                    "memcmp": {
+                        "offset": 0,
+                        "bytes": self.token_mint
+                    }
+                }
+            ]
+            
+            params = [
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token program ID
+                {
+                    "encoding": "jsonParsed",
+                    "filters": filters
+                }
+            ]
+            
+            self.logger.info(f"Querying token accounts for mint: {self.token_mint}")
+            response = self.make_rpc_request("getProgramAccounts", params)
+            
+            if response and 'result' in response:
+                accounts = response['result']
+                self.logger.info(f"Found {len(accounts)} token accounts in response")
+                
+                # Log first account structure for debugging
+                if accounts:
+                    self.logger.debug(f"Sample account structure: {json.dumps(accounts[0], indent=2)}")
+                
+                return accounts
+            else:
+                self.logger.warning(f"Unexpected response structure: {json.dumps(response, indent=2)}")
+                return []
+            
+        except Exception as e:
+            self.logger.exception(f"Error fetching token accounts: {str(e)}")
+            return []
+
+    def get_token_accounts(self) -> List[Dict]:
+        """Query all token holders"""
+        self.logger.info("\nStarting token account collection...")
+        try:
+            accounts = self.get_token_accounts_by_program()
             holders = []
             
-            # Get largest accounts first
-            largest_accounts = self.get_token_largest_accounts()
-            print(f"Found {len(largest_accounts)} large accounts to process")
+            for account in accounts:
+                try:
+                    # Parse the account data
+                    parsed_info = account['account']['data']['parsed']['info']
+                    balance = int(parsed_info['tokenAmount']['amount'])
+                    owner = parsed_info['owner']
+                    
+                    if balance >= self.min_token_amount:
+                        self.logger.info(f"Found holder {owner} with balance {balance:,}")
+                        holders.append({
+                            'address': owner,
+                            'balance': balance
+                        })
+                except (KeyError, TypeError) as e:
+                    self.logger.error(f"Error parsing account data: {str(e)}")
+                    self.logger.error(f"Account structure: {json.dumps(account, indent=2)}")
+                    continue
             
-            for i, account in enumerate(largest_accounts):
-                print(f"\nProcessing account {i+1}/{len(largest_accounts)}")
-                account_info = self.get_account_info(account['address'])
-                
-                if account_info and 'data' in account_info:
-                    try:
-                        parsed_data = account_info['data']['parsed']['info']
-                        balance = int(parsed_data['tokenAmount']['amount'])
-                        owner = parsed_data['owner']
-                        
-                        if balance > 0:
-                            print(f"Added holder {owner} with balance {balance}")
-                            holders.append({
-                                'address': owner,
-                                'balance': balance
-                            })
-                    except (KeyError, TypeError) as e:
-                        print(f"Error parsing account data: {str(e)}")
-                        continue
+            self.logger.info(f"\nFinished collecting {len(holders)} holder accounts with balance >= {self.min_token_amount:,}")
             
-            print(f"\nFinished collecting {len(holders)} holder accounts")
+            # Log some sample data for debugging
+            if holders:
+                self.logger.info("Sample holder data:")
+                for holder in holders[:3]:
+                    self.logger.info(f"Address: {holder['address']}, Balance: {holder['balance']:,}")
+            
             return holders
             
         except Exception as e:
-            print(f"Error in get_token_accounts: {str(e)}")
+            self.logger.exception(f"Error in get_token_accounts: {str(e)}")
             return []
 
     def get_token_sol_price(self) -> float:
@@ -323,51 +410,65 @@ class TokenSnapshot:
 
     def take_snapshot(self) -> Dict:
         """Take a snapshot of all token holders and their balances"""
-        print("\nTaking new snapshot...")
-        timestamp = datetime.now()
-        holders = self.get_token_accounts()
-        
-        if not holders:
-            print("No holders found in snapshot")
-            return None
+        self.logger.info("\nTaking new snapshot...")
+        try:
+            timestamp = datetime.now()
+            holders = self.get_token_accounts()
             
-        print("Processing holder data...")
-        # Create DataFrame
-        df = pd.DataFrame(holders)
-        
-        # Group by address and sum balances
-        df = df.groupby('address')['balance'].sum().reset_index()
-        
-        # Sort by balance descending
-        df = df.sort_values('balance', ascending=False)
-        
-        # Add timestamp
-        df['timestamp'] = timestamp.isoformat()
-        
-        # Calculate total supply and market cap
-        total_supply = df['balance'].sum()
-        market_cap = self.calculate_market_cap(total_supply)
-        
-        print(f"Total supply: {total_supply}")
-        print(f"Market cap in SOL: {market_cap}")
-        
-        # Save snapshot with timestamp
-        filename = f"{self.snapshot_dir}/snapshot_{timestamp.strftime('%Y%m%d_%H%M%S')}"
-        df.to_csv(f"{filename}.csv", index=False)
-        
-        snapshot_info = {
-            'timestamp': timestamp.isoformat(),
-            'total_holders': len(df),
-            'total_supply': float(total_supply),
-            'market_cap_sol': market_cap,
-            'target_reached': market_cap >= self.target_mcap if market_cap else False
-        }
-        
-        with open(f"{filename}_info.json", 'w') as f:
-            json.dump(snapshot_info, f, indent=2)
-        
-        print("Snapshot saved successfully")
-        return snapshot_info
+            if not holders:
+                self.logger.warning("No holders found in snapshot")
+                return None
+                
+            self.logger.info("Processing holder data...")
+            # Create DataFrame
+            df = pd.DataFrame(holders)
+            
+            # Group by address and sum balances (in case of multiple accounts)
+            df = df.groupby('address')['balance'].sum().reset_index()
+            
+            # Filter for minimum balance
+            df = df[df['balance'] >= self.min_token_amount]
+            
+            # Sort by balance descending
+            df = df.sort_values('balance', ascending=False)
+            
+            # Add timestamp
+            df['timestamp'] = timestamp.isoformat()
+            
+            # Log some statistics
+            self.logger.info(f"Total unique holders: {len(df)}")
+            self.logger.info(f"Top 5 holders:")
+            for _, row in df.head().iterrows():
+                self.logger.info(f"Address: {row['address']}, Balance: {row['balance']:,}")
+            
+            # Calculate total supply and market cap
+            total_supply = df['balance'].sum()
+            market_cap = self.calculate_market_cap(total_supply)
+            
+            self.logger.info(f"Total supply: {total_supply:,}")
+            self.logger.info(f"Market cap in SOL: {market_cap}")
+            
+            # Save snapshot with timestamp
+            filename = f"{self.snapshot_dir}/snapshot_{timestamp.strftime('%Y%m%d_%H%M%S')}"
+            df.to_csv(f"{filename}.csv", index=False)
+            
+            snapshot_info = {
+                'timestamp': timestamp.isoformat(),
+                'total_holders': len(df),
+                'total_supply': float(total_supply),
+                'market_cap_sol': market_cap,
+                'target_reached': market_cap >= self.target_mcap if market_cap else False
+            }
+            
+            with open(f"{filename}_info.json", 'w') as f:
+                json.dump(snapshot_info, f, indent=2)
+            
+            self.logger.info("Snapshot saved successfully")
+            return snapshot_info
+            
+        except Exception as e:
+            self.logger.exception(f"Error taking snapshot: {str(e)}")
+            return None
 
     def monitor_market_cap(self):
         """Continuously monitor market cap and take snapshots at appropriate intervals"""
