@@ -456,10 +456,10 @@ class TokenSnapshot:
             
             snapshot_info = {
                 'timestamp': timestamp.isoformat(),
-                'total_holders': len(df),
-                'total_supply': float(total_supply),
-                'market_cap_sol': market_cap,
-                'target_reached': market_cap >= self.target_mcap if market_cap else False
+                'total_holders': int(len(df)),  # Convert to regular Python int
+                'total_supply': float(total_supply),  # Convert to regular Python float
+                'market_cap_sol': float(market_cap) if market_cap else None,  # Convert to regular Python float
+                'target_reached': bool(market_cap >= self.target_mcap if market_cap else False)  # Convert to regular Python bool
             }
             
             with open(f"{filename}_info.json", 'w') as f:
