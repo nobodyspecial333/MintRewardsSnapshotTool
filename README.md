@@ -113,10 +113,6 @@ The script includes comprehensive error handling and logging:
 - Hourly retries for major failures
 - Verbose logging of all operations
 
-## Contributing
-
-Feel free to submit issues and pull requests for additional features or improvements.
-
 ## License
 
 Free for anyone who owns a Solana token to use. I recommend you grab a bag of MintRewards (RWRD) though ... :) ca: 7yM17krfficCdkqg1CNRdptepryrxxFC4hayNmfVuRVc
