@@ -2,16 +2,16 @@ Free for anyone who owns a Solana token to use. I recommend you grab a bag of Mi
 
 # Solana Token Snapshot Tool
 
-A Python tool to monitor and capture token holder snapshots for Solana SPL tokens. The tool continuously monitors the token's market cap and adjusts snapshot frequency based on how close it is to a target value.
+A Python tool to monitor and capture token holder snapshots for Solana SPL tokens. The tool continuously monitors bonding progress and adjusts snapshot frequency based on progress percentage.
 
 ## Features
 
 - Captures snapshots of token holders and their balances
-- Monitors market cap and automatically adjusts snapshot frequency
+- Monitors bonding progress using DexScreener API
+- Automatically adjusts snapshot frequency based on progress
 - Saves snapshots in both CSV and JSON formats
 - Implements rate limiting and retry logic for RPC calls
 - Supports custom RPC endpoints
-- Adapts snapshot frequency based on proximity to target market cap
 
 ## Prerequisites
 
@@ -36,17 +36,19 @@ A Python tool to monitor and capture token holder snapshots for Solana SPL token
 Create a `.env` file in the project root directory with the following parameters:
 
 ```ini
-SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+HELIUS_API_KEY=your_helius_api_key_here
 TOKEN_MINT_ADDRESS=your_token_mint_address
 TARGET_MCAP_SOL=500
 SNAPSHOT_DIR=snapshots
+MIN_TOKEN_AMOUNT=1000000
 ```
 
 ### Parameters:
-- `SOLANA_RPC_URL`: Your Solana RPC endpoint (public or private)
+- `HELIUS_API_KEY`: Your Helius API key
 - `TOKEN_MINT_ADDRESS`: The mint address of your SPL token
-- `TARGET_MCAP_SOL`: Target market cap in SOL where you want to capture the final snapshot
+- `TARGET_MCAP_SOL`: Target market cap in SOL for bonding
 - `SNAPSHOT_DIR`: Directory where snapshots will be saved
+- `MIN_TOKEN_AMOUNT`: Minimum token amount to include in snapshots
 
 ## Usage
 
@@ -56,14 +58,16 @@ python token_snapshot.py
 ```
 
 The script will:
-1. Start monitoring the token's market cap
-2. Take periodic snapshots based on proximity to target:
-   - Within 10 SOL: Every minute
-   - Within 50 SOL: Every 5 minutes
-   - Within 100 SOL: Every 15 minutes
-   - Otherwise: Every hour
-3. Save snapshots to the configured directory
-4. Stop when the target market cap is reached
+1. Take an initial snapshot regardless of progress
+2. Check bonding progress every 5 minutes
+3. Take periodic snapshots based on progress:
+   - Below 85%: Only initial snapshot
+   - 85-90%: Daily snapshots
+   - 90-95%: Every 4 hours
+   - 95-97%: Every hour
+   - 97-99%: Every 30 minutes
+   - 99%+: Every 5 minutes
+4. Take final snapshot when target is reached
 
 ## Output Files
 
@@ -78,39 +82,24 @@ Each snapshot generates two files:
    - Timestamp
    - Total holders
    - Total supply
-   - Market cap in SOL
+   - SOL volume
+   - Progress percentage
    - Target reached status
 
 ## Rate Limiting
 
 The tool implements rate limiting to work with public RPC endpoints:
-- 1 second delay between requests
+- Adaptive request delays
 - Maximum 3 retries for failed requests
-- Exponential backoff for retries
-
-## Recommendations
-
-### RPC Providers
-For better reliability, use a dedicated RPC endpoint provider like:
-- QuickNode
-- Triton
-- Helius
-- GenesysGo
-
-### Rate Limit Adjustment
-Adjust rate limiting parameters in the code:
-```python
-self.request_delay = 1.0  # Delay between requests in seconds
-self.max_retries = 3     # Maximum number of retries
-self.retry_delay = 2     # Base delay for retry backoff
-```
+- Super-exponential backoff for retries
+- Circuit breaker protection
 
 ## Error Handling
 
 The script includes comprehensive error handling and logging:
 - Detailed error messages for RPC calls
 - Retry logic for failed requests
-- Hourly retries for major failures
+- Automatic endpoint rotation on rate limits
 - Verbose logging of all operations
 
 ## License
