@@ -23,10 +23,10 @@ class TokenSnapshot:
         self.logger.info("Starting TokenSnapshot initialization...")
         
         # Load configuration from .env
-        self.primary_rpc_url = os.getenv('SOLANA_RPC_URL')
-        # Update RPC endpoints list (remove unreliable ones)
+        helius_api_key = os.getenv('HELIUS_API_KEY')
+        # Update RPC endpoints list with Helius
         self.rpc_endpoints = [
-            self.primary_rpc_url,
+            f"https://mainnet.helius-rpc.com/?api-key={helius_api_key}",
             "https://rpc.ankr.com/solana",
             "https://api.mainnet-beta.solana.com"
         ]
@@ -315,11 +315,13 @@ class TokenSnapshot:
                 "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token program ID
                 {
                     "encoding": "jsonParsed",
-                    "filters": filters
+                    "filters": filters,
+                    "commitment": "confirmed"
                 }
             ]
             
             self.logger.info(f"Querying token accounts for mint: {self.token_mint}")
+            self.logger.debug(f"Using RPC endpoint: {self.rpc_url}")
             response = self.make_rpc_request("getProgramAccounts", params)
             
             if response and 'result' in response:
