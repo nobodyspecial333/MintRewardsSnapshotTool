@@ -11,6 +11,7 @@ from time import sleep
 from typing import List, Dict, Any
 import random
 import logging
+import traceback
 
 class TokenSnapshot:
     def __init__(self):
@@ -36,34 +37,32 @@ class TokenSnapshot:
         self.token_mint = os.getenv('TOKEN_MINT_ADDRESS')
         self.target_mcap = float(os.getenv('TARGET_MCAP_SOL', '500'))
         self.snapshot_dir = os.getenv('SNAPSHOT_DIR', 'snapshots')
+        self.min_token_amount = float(os.getenv('MIN_TOKEN_AMOUNT', '1000000'))  # Added configurable minimum
         
-        # Even more conservative settings
-        self.request_delay = 30.0        # Increased to 30 seconds base delay
-        self.max_retries = 8
-        self.retry_delay = 45            # Increased to 45 seconds base retry delay
-        self.jitter_range = 5.0
-        self.startup_cooldown = 60.0     # Increased to 60 seconds
+        # More aggressive settings for Helius
+        self.request_delay = 5.0         # Reduced from 30 to 5 seconds
+        self.max_retries = 3             # Reduced from 8 to 3 since Helius is more reliable
+        self.retry_delay = 10            # Reduced from 45 to 10 seconds
+        self.jitter_range = 2.0          # Reduced from 5 to 2 seconds
+        self.startup_cooldown = 10.0     # Reduced from 60 to 10 seconds
         
         # Circuit breaker settings
-        self.error_threshold = 2         # Reduced to 2 errors
-        self.circuit_cooldown = 300.0    # 5 minutes cooldown
-        self.error_window = 60
+        self.error_threshold = 5         # Increased from 2 to 5 since Helius is more stable
+        self.circuit_cooldown = 60.0     # Reduced from 300 to 60 seconds
+        self.error_window = 30           # Reduced from 60 to 30 seconds
         self.error_timestamps = []
         self.circuit_broken = False
         self.circuit_break_time = None
         
         # RPC endpoint rotation settings
         self.endpoint_errors = {url: 0 for url in self.rpc_endpoints}
-        self.endpoint_cooldown = 600.0   # 10 minutes cooldown for failed endpoints
+        self.endpoint_cooldown = 300.0   # Reduced from 600 to 300 seconds
         self.endpoint_last_error = {url: None for url in self.rpc_endpoints}
         
         # Add request tracking
         self.request_count = 0
         self.last_request_time = None
         self.error_count = 0
-        
-        # Add token threshold
-        self.min_token_amount = 1_000_000  # Minimum token amount to include
         
         # Log all configuration values
         self.logger.info("Configuration values:")
@@ -341,95 +340,114 @@ class TokenSnapshot:
             self.logger.exception(f"Error fetching token accounts: {str(e)}")
             return []
 
-    def get_token_accounts(self) -> List[Dict]:
-        """Query all token holders"""
+    def get_token_accounts(self) -> tuple[List[Dict], float]:
+        """Query all token holders and return both filtered holders and total supply"""
         self.logger.info("\nStarting token account collection...")
         try:
             accounts = self.get_token_accounts_by_program()
-            holders = []
+            holder_balances = {}  # Dictionary to track total balance per holder
+            total_supply = 0
             
             for account in accounts:
                 try:
                     # Parse the account data
                     parsed_info = account['account']['data']['parsed']['info']
-                    balance = int(parsed_info['tokenAmount']['amount'])
+                    raw_balance = int(parsed_info['tokenAmount']['amount'])
+                    decimals = int(parsed_info['tokenAmount']['decimals'])
+                    # Adjust balance for decimals
+                    balance = raw_balance / (10 ** decimals)
                     owner = parsed_info['owner']
                     
-                    if balance >= self.min_token_amount:
-                        self.logger.info(f"Found holder {owner} with balance {balance:,}")
-                        holders.append({
-                            'address': owner,
-                            'balance': balance
-                        })
+                    # Add to total supply
+                    total_supply += balance
+                    
+                    # Aggregate balance by owner
+                    holder_balances[owner] = holder_balances.get(owner, 0) + balance
+                
                 except (KeyError, TypeError) as e:
                     self.logger.error(f"Error parsing account data: {str(e)}")
-                    self.logger.error(f"Account structure: {json.dumps(account, indent=2)}")
                     continue
             
-            self.logger.info(f"\nFinished collecting {len(holders)} holder accounts with balance >= {self.min_token_amount:,}")
+            # Create holder list after aggregating balances
+            all_holders = [
+                {'address': owner, 'balance': balance}
+                for owner, balance in holder_balances.items()
+            ]
             
-            # Log some sample data for debugging
-            if holders:
-                self.logger.info("Sample holder data:")
-                for holder in holders[:3]:
-                    self.logger.info(f"Address: {holder['address']}, Balance: {holder['balance']:,}")
+            # Filter holders above minimum
+            filtered_holders = [
+                holder for holder in all_holders
+                if holder['balance'] >= self.min_token_amount
+            ]
             
-            return holders
+            # Sort by balance
+            filtered_holders.sort(key=lambda x: x['balance'], reverse=True)
+            
+            self.logger.info(f"\nTotal supply: {total_supply:,.2f}")
+            self.logger.info(f"Unique holders (after aggregating): {len(holder_balances)}")
+            self.logger.info(f"Holders with >= {self.min_token_amount:,} tokens: {len(filtered_holders)}")
+            
+            # Log some sample data
+            if filtered_holders:
+                self.logger.info("\nTop 5 holders:")
+                for holder in filtered_holders[:5]:
+                    self.logger.info(f"Address: {holder['address']}, Balance: {holder['balance']:,.2f}")
+            
+            return filtered_holders, total_supply
             
         except Exception as e:
             self.logger.exception(f"Error in get_token_accounts: {str(e)}")
-            return []
+            return [], 0
 
     def get_token_sol_price(self) -> float:
-        # Placeholder - implement your specific token pricing logic
-        return 0.001  # Example value
+        """Calculate token price in SOL based on current market data"""
+        # Market cap is $43,000 and SOL price is $207.22
+        # Total supply is 983,819,627.71 tokens
+        # So: token_price_in_usd = $43,000 / 983,819,627.71 ≈ $0.0000437 per token
+        # token_price_in_sol = $0.0000437 / $207.22 ≈ 0.000000211 SOL per token
+        return 0.000000211  # SOL per token
 
-    def calculate_market_cap(self, total_supply: int) -> float:
-        """Calculate market cap in SOL based on current token supply and price"""
+    def calculate_market_cap(self, total_supply: float) -> tuple[float, float]:
+        """Calculate total SOL volume and progress"""
         try:
-            token_price_in_sol = self.get_token_sol_price()
-            market_cap_in_sol = total_supply * token_price_in_sol
-            return market_cap_in_sol
+            # Use the quick check method to get current progress
+            return self.quick_market_cap_check()
         except Exception as e:
-            print(f"Error calculating market cap: {str(e)}")
+            self.logger.error(f"Error calculating SOL volume: {str(e)}")
             return None
 
-    def determine_snapshot_interval(self, current_mcap: float) -> int:
-        """Determine snapshot interval based on how close we are to target market cap"""
-        if current_mcap is None:
-            return 3600  # Default to hourly if we can't calculate market cap
-        
-        mcap_difference = abs(self.target_mcap - current_mcap)
-        
-        if mcap_difference <= 10:  # Within 10 SOL
-            return 60  # Every minute
-        elif mcap_difference <= 50:  # Within 50 SOL
+    def determine_snapshot_interval(self, progress: float) -> int:
+        """Determine snapshot interval based on bonding progress"""
+        if progress >= 99:
             return 300  # Every 5 minutes
-        elif mcap_difference <= 100:  # Within 100 SOL
-            return 900  # Every 15 minutes
-        else:
+        elif progress >= 97:
+            return 1800  # Every 30 minutes
+        elif progress >= 95:
             return 3600  # Every hour
+        elif progress >= 90:
+            return 14400  # Every 4 hours
+        elif progress >= 85:
+            return 86400  # Every 24 hours
+        else:
+            return None  # No regular snapshots below 85%
 
     def take_snapshot(self) -> Dict:
         """Take a snapshot of all token holders and their balances"""
         self.logger.info("\nTaking new snapshot...")
         try:
             timestamp = datetime.now()
-            holders = self.get_token_accounts()
+            holders, total_supply = self.get_token_accounts()  # Get both holders and total supply
             
             if not holders:
                 self.logger.warning("No holders found in snapshot")
                 return None
                 
             self.logger.info("Processing holder data...")
-            # Create DataFrame
+            # Create DataFrame for filtered holders
             df = pd.DataFrame(holders)
             
             # Group by address and sum balances (in case of multiple accounts)
             df = df.groupby('address')['balance'].sum().reset_index()
-            
-            # Filter for minimum balance
-            df = df[df['balance'] >= self.min_token_amount]
             
             # Sort by balance descending
             df = df.sort_values('balance', ascending=False)
@@ -438,17 +456,21 @@ class TokenSnapshot:
             df['timestamp'] = timestamp.isoformat()
             
             # Log some statistics
-            self.logger.info(f"Total unique holders: {len(df)}")
+            self.logger.info(f"Total unique holders above minimum: {len(df)}")
             self.logger.info(f"Top 5 holders:")
             for _, row in df.head().iterrows():
-                self.logger.info(f"Address: {row['address']}, Balance: {row['balance']:,}")
+                self.logger.info(f"Address: {row['address']}, Balance: {row['balance']:,.2f}")
             
-            # Calculate total supply and market cap
-            total_supply = df['balance'].sum()
-            market_cap = self.calculate_market_cap(total_supply)
+            # Calculate market cap using TOTAL supply
+            market_cap_info = self.calculate_market_cap(total_supply)
+            if market_cap_info:
+                sol_volume, progress = market_cap_info
+            else:
+                sol_volume, progress = 0, 0
             
-            self.logger.info(f"Total supply: {total_supply:,}")
-            self.logger.info(f"Market cap in SOL: {market_cap}")
+            self.logger.info(f"Total supply: {total_supply:,.2f}")
+            self.logger.info(f"SOL Volume: {sol_volume:.2f}")
+            self.logger.info(f"Progress: {progress:.2f}%")
             
             # Save snapshot with timestamp
             filename = f"{self.snapshot_dir}/snapshot_{timestamp.strftime('%Y%m%d_%H%M%S')}"
@@ -456,10 +478,11 @@ class TokenSnapshot:
             
             snapshot_info = {
                 'timestamp': timestamp.isoformat(),
-                'total_holders': int(len(df)),  # Convert to regular Python int
-                'total_supply': float(total_supply),  # Convert to regular Python float
-                'market_cap_sol': float(market_cap) if market_cap else None,  # Convert to regular Python float
-                'target_reached': bool(market_cap >= self.target_mcap if market_cap else False)  # Convert to regular Python bool
+                'total_holders': int(len(df)),
+                'total_supply': float(total_supply),
+                'sol_volume': float(sol_volume),
+                'progress': float(progress),
+                'target_reached': bool(progress >= 100)
             }
             
             with open(f"{filename}_info.json", 'w') as f:
@@ -472,48 +495,102 @@ class TokenSnapshot:
             self.logger.exception(f"Error taking snapshot: {str(e)}")
             return None
 
+    def quick_market_cap_check(self) -> tuple[float, float]:
+        """Check bonding progress using DexScreener"""
+        try:
+            dexscreener_url = f"https://api.dexscreener.com/latest/dex/tokens/{self.token_mint}"
+            response = requests.get(dexscreener_url)
+            data = response.json()
+            
+            if data and 'pairs' in data and len(data['pairs']) > 0:
+                pair = data['pairs'][0]
+                
+                if 'moonshot' in pair and 'progress' in pair['moonshot']:
+                    progress = float(pair['moonshot']['progress'])
+                    sol_volume = (progress / 100) * self.target_mcap
+                    
+                    self.logger.info(f"\nProgress check at {datetime.now()}")
+                    self.logger.info(f"Progress to target: {progress:.1f}%")
+                    self.logger.info(f"Estimated SOL volume: {sol_volume:.2f} SOL")
+                    self.logger.info(f"Distance to target: {self.target_mcap - sol_volume:.2f} SOL")
+                    
+                    return sol_volume, progress
+                
+            return None
+        except Exception as e:
+            self.logger.error(f"Error in progress check: {str(e)}")
+            return None
+
     def monitor_market_cap(self):
-        """Continuously monitor market cap and take snapshots at appropriate intervals"""
-        print(f"Starting market cap monitoring. Target: {self.target_mcap} SOL")
+        """Continuously monitor bonding progress and take snapshots at appropriate intervals"""
+        self.logger.info(f"Starting bonding progress monitoring. Target: {self.target_mcap} SOL")
+        
+        # Take initial snapshot regardless of progress
+        initial_snapshot = self.take_snapshot()
+        if initial_snapshot:
+            self.logger.info("Initial snapshot taken successfully")
+        
+        last_snapshot_time = datetime.now()
+        next_snapshot_time = None
+        last_check_time = datetime.now()
+        check_interval = 300  # Check progress every 5 minutes
         
         while True:
             try:
-                snapshot_info = self.take_snapshot()
+                current_time = datetime.now()
                 
-                if snapshot_info:
-                    current_mcap = snapshot_info['market_cap_sol']
-                    print(f"\nSnapshot taken at {snapshot_info['timestamp']}")
-                    print(f"Current Market Cap: {current_mcap:.2f} SOL")
-                    print(f"Total Holders: {snapshot_info['total_holders']}")
+                # Do progress check every 5 minutes
+                if (current_time - last_check_time).total_seconds() >= check_interval:
+                    progress_info = self.quick_market_cap_check()
+                    last_check_time = current_time
                     
-                    if snapshot_info['target_reached']:
-                        print(f"\n🎯 TARGET MARKET CAP REACHED! 🎯")
-                        print("Final snapshot saved. Monitoring stopped.")
+                    if progress_info:
+                        sol_volume, progress = progress_info
+                        
+                        # Determine next snapshot interval based on progress
+                        interval = self.determine_snapshot_interval(progress)
+                        
+                        if interval:
+                            # If we don't have a next snapshot time or we're at 99%+, set it
+                            if next_snapshot_time is None:
+                                next_snapshot_time = last_snapshot_time + timedelta(seconds=interval)
+                                self.logger.info(f"Next snapshot scheduled for: {next_snapshot_time}")
+                            
+                            # Check if it's time for a snapshot
+                            if current_time >= next_snapshot_time:
+                                self.logger.info("Taking scheduled snapshot...")
+                                snapshot_info = self.take_snapshot()
+                                if snapshot_info:
+                                    last_snapshot_time = current_time
+                                    next_snapshot_time = current_time + timedelta(seconds=interval)
+                                    self.logger.info(f"Next snapshot scheduled for: {next_snapshot_time}")
+                    
+                    # Check if we've reached 100%
+                    if progress >= 100:
+                        self.logger.info("🎯 BONDING TARGET REACHED! Taking final snapshot...")
+                        final_snapshot = self.take_snapshot()
+                        if final_snapshot:
+                            self.logger.info("Final snapshot saved. Monitoring stopped.")
                         break
-                    
-                    # Determine next snapshot interval
-                    interval = self.determine_snapshot_interval(current_mcap)
-                    print(f"Next snapshot in {interval/60:.1f} minutes")
-                    
-                    time.sleep(interval)
-                else:
-                    print("Error taking snapshot. Retrying in 1 hour...")
-                    time.sleep(3600)
+                
+                # Sleep for a short interval to prevent CPU overuse
+                time.sleep(30)  # Check every 30 seconds
                     
             except Exception as e:
-                print(f"Error in monitoring loop: {str(e)}")
-                print(f"Stack trace:", e.__traceback__)
-                time.sleep(3600)  # Retry in an hour if there's an error
+                self.logger.error(f"Error in monitoring loop: {str(e)}")
+                self.logger.error(f"Full error: {traceback.format_exc()}")
+                time.sleep(30)  # Wait before retrying
 
 def main():
     # Create .env file template if it doesn't exist
     if not os.path.exists('.env'):
         with open('.env', 'w') as f:
             f.write("""# Solana Configuration
-SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+HELIUS_API_KEY=your_helius_api_key_here
 TOKEN_MINT_ADDRESS=your_token_mint_address
 TARGET_MCAP_SOL=500
 SNAPSHOT_DIR=snapshots
+MIN_TOKEN_AMOUNT=1000000
 """)
         print("Created .env template file. Please fill in your configuration details.")
         return
