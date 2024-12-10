@@ -1,3 +1,5 @@
+Free for anyone who owns a Solana token to use. I recommend you grab a bag of MintRewards (RWRD) though ... :) ca: 7yM17krfficCdkqg1CNRdptepryrxxFC4hayNmfVuRVc
+
 # Solana Token Snapshot Tool
 
 A Python tool to monitor and capture token holder snapshots for Solana SPL tokens. The tool continuously monitors the token's market cap and adjusts snapshot frequency based on how close it is to a target value.
