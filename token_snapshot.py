@@ -534,6 +534,9 @@ class TokenSnapshot:
         next_snapshot_time = None
         last_check_time = datetime.now()
         check_interval = 300  # Check progress every 5 minutes
+        last_progress = None  # Track last progress percentage
+        thresholds = [85, 90, 95, 97, 99]  # Progress thresholds
+        last_threshold = None  # Track last threshold crossed
         
         while True:
             try:
@@ -547,23 +550,45 @@ class TokenSnapshot:
                     if progress_info:
                         sol_volume, progress = progress_info
                         
+                        # Check if we've crossed any thresholds
+                        current_threshold = None
+                        for threshold in thresholds:
+                            if progress >= threshold:
+                                current_threshold = threshold
+                                continue
+                            break
+                        
+                        # Take snapshot if we've crossed a threshold in either direction
+                        if (last_threshold is not None and current_threshold != last_threshold) or \
+                           (last_threshold is None and current_threshold is not None):
+                            self.logger.info(f"Progress threshold crossed: {current_threshold}% - Taking snapshot...")
+                            snapshot_info = self.take_snapshot()
+                            if snapshot_info:
+                                last_snapshot_time = current_time
+                                last_threshold = current_threshold
+                        
                         # Determine next snapshot interval based on progress
                         interval = self.determine_snapshot_interval(progress)
                         
                         if interval:
-                            # If we don't have a next snapshot time or we're at 99%+, set it
-                            if next_snapshot_time is None:
-                                next_snapshot_time = last_snapshot_time + timedelta(seconds=interval)
-                                self.logger.info(f"Next snapshot scheduled for: {next_snapshot_time}")
+                            # Update next snapshot time if needed
+                            if next_snapshot_time is None or current_time >= next_snapshot_time:
+                                next_snapshot_time = current_time + timedelta(seconds=interval)
+                                self.logger.info(f"Next scheduled snapshot at: {next_snapshot_time.strftime('%Y-%m-%d %H:%M:%S')}")
                             
-                            # Check if it's time for a snapshot
+                            # Take a snapshot if it's time
                             if current_time >= next_snapshot_time:
                                 self.logger.info("Taking scheduled snapshot...")
                                 snapshot_info = self.take_snapshot()
                                 if snapshot_info:
                                     last_snapshot_time = current_time
                                     next_snapshot_time = current_time + timedelta(seconds=interval)
-                                    self.logger.info(f"Next snapshot scheduled for: {next_snapshot_time}")
+                                    self.logger.info(f"Next scheduled snapshot at: {next_snapshot_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    
+                    # Always show when next snapshot is scheduled
+                    if next_snapshot_time:
+                        time_to_next = (next_snapshot_time - current_time).total_seconds()
+                        self.logger.info(f"Time until next snapshot: {time_to_next/60:.1f} minutes")
                     
                     # Check if we've reached 100%
                     if progress >= 100:
@@ -572,7 +597,9 @@ class TokenSnapshot:
                         if final_snapshot:
                             self.logger.info("Final snapshot saved. Monitoring stopped.")
                         break
-                
+                    
+                    last_progress = progress
+            
                 # Sleep for a short interval to prevent CPU overuse
                 time.sleep(30)  # Check every 30 seconds
                     
